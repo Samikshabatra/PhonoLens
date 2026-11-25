@@ -19,6 +19,19 @@ import phonolens_core as pc
 SR = 16000
 FRAME_S = 0.02                 # wav2vec2: one output frame per 20 ms
 TOP_K_SUBS = 5                 # competitor phones tried per position for GOP
+# Speech gate. On silence or room noise the recogniser hears no phones, yet the scorer still
+# gives each "dropped" phone a middling score (~60/100 overall), so we refuse to score instead.
+MIN_HEARD_RATIO = 0.25         # recognised phones / expected phones below this = no speech
+MIN_MATCH_RATIO = 0.25         # expected phones heard exactly below this = a different sentence
+# A Rule-B flag is shown as an "error" only when the phone scorer (0-100) agrees it is weak.
+ERROR_SCORE_SUBSTITUTION = 75
+ERROR_SCORE_DELETION = 50
+WORD_TRIM_FLOOR_DB = -40       # frames this far below the loudest frame count as silence at word edges
+
+# Reference voices for "hear the correct pronunciation" (Microsoft neural TTS via edge-tts).
+TTS_VOICES = {"female": "en-IN-NeerjaNeural", "male": "en-IN-PrabhatNeural"}
+TTS_RATES = {"normal": "+0%", "slow": "-30%"}
+TTS_CACHE_MAX = 200
 
 PROMPTS = [
     "The thin vest was very warm.",
@@ -241,32 +254,36 @@ class Engine:
         if np.abs(wav).max() > 0:
             wav = wav / np.abs(wav).max() * 0.9
         words = re.findall(r"[A-Za-z']+", text)
-        word_phones = [pc.text_to_phones(w) for w in words]
+        word_phones = [word_to_phones(w) for w in words]
         canon = [p for ph in word_phones for p in ph]
         if not canon:
             return {"error": "No English words found in the text."}
         lp = self.log_probs(wav)
         if lp.shape[0] < len(canon):
             return {"error": "The recording is too short for this sentence."}
+        recognised = [pc.ID2PH[i] for i in pc.ctc_greedy(lp.argmax(-1), blank=0)]
+        gate = speech_gate(canon, recognised, text)
+        if gate:
+            return gate
         rows = phone_features(lp, canon, wav=wav, norms=self.norms, formant_kw=self.formant_kw,
                               device=self.device)
         scores = self.score_rows(rows)
-        recognised = [pc.ID2PH[i] for i in pc.ctc_greedy(lp.argmax(-1), blank=0)]
 
         phones, k = [], 0
         for wi, (w, ph) in enumerate(zip(words, word_phones)):
-            for _ in ph:
+            for j in range(len(ph)):
                 r = rows[k]
-                flagged = flag_indian(r, self.thresholds)
-                accent_ok = r["heard"] != r["phone"] and (r["phone"], r["heard"]) in pc.INDIAN_ENGLISH_ACCEPT
+                score = round(float(scores[k]) * 50, 1)
+                status = phone_status(r, score, ph, j, self.thresholds)
                 phones.append({
                     "word": w, "word_index": wi, "expected": r["phone"], "heard": r["heard"],
-                    "ok": not flagged, "accent_variant": bool(accent_ok),
-                    "score": round(float(scores[k]) * 50, 1),
+                    "status": status, "ok": status != "error", "accent_variant": status == "variant",
+                    "score": score,
                     "start": _num(r["start"]), "end": _num(r["end"]),
-                    "tip": pc.feedback_for(r["phone"], r["heard"]) if flagged else None,
+                    "tip": pc.feedback_for(r["phone"], r["heard"]) if status in ("error", "almost") else None,
                 })
                 k += 1
+        trim_word_silence(phones, wav)
         vowels = []
         for r, ph in zip(rows, phones):
             if r["phone"] in pc.MONOPHTHONGS and np.isfinite(r["zF1"]):
@@ -284,9 +301,113 @@ class Engine:
         for p in phones:
             if p["tip"] and p["tip"] not in tips:
                 tips.append(p["tip"])
+        count = {s: sum(p["status"] == s for p in phones) for s in ("correct", "variant", "almost", "error")}
         return {"text": text, "overall": round(float(np.mean(scores)) * 50, 1),
+                "summary": {"total": len(phones), **count},
                 "words": word_scores, "phones": phones, "vowels": vowels, "tips": tips,
                 "recognised": " ".join(recognised), "expected": " ".join(canon)}
+
+
+def speech_gate(canon, recognised, text):
+    """Return an error dict when the recording holds no speech or a different sentence, else None."""
+    n = max(1, len(canon))
+    if len(recognised) / n < MIN_HEARD_RATIO:
+        return {"error": "We couldn't hear any speech. Check your microphone and read the sentence aloud.",
+                "code": "no_speech"}
+    matched = sum(1 for c, r in zip(canon, pc.realised_per_canonical(canon, recognised)) if c == r)
+    if matched / n < MIN_MATCH_RATIO:
+        return {"error": f'That didn\'t sound like "{text.strip().rstrip(".!?")}". Read the sentence shown and try again.',
+                "code": "wrong_sentence"}
+    return None
+
+
+def trim_word_silence(phones, wav, floor_db=WORD_TRIM_FLOOR_DB):
+    """Shrink each word's time span to the part that actually contains sound.
+
+    CTC forced alignment gives every phone the blank frames that follow it, so the last phone of a
+    word also "owns" the pause after the word. That made words look as if they were spoken over
+    silence. Frames quieter than `floor_db` below the loudest frame are trimmed from word edges.
+    """
+    hop = int(SR * FRAME_S)
+    n = len(wav) // hop
+    if n == 0:
+        return
+    frames = np.asarray(wav[: n * hop], dtype=np.float64).reshape(n, hop)
+    energy = 10 * np.log10(np.mean(frames ** 2, axis=1) + 1e-12)
+    speech = energy > energy.max() + floor_db
+    for wi in sorted({p["word_index"] for p in phones}):
+        ps = [p for p in phones if p["word_index"] == wi and p["start"] is not None and p["end"] is not None]
+        if not ps:
+            continue
+        a, b = int(round(ps[0]["start"] / FRAME_S)), int(round(ps[-1]["end"] / FRAME_S))
+        idx = np.nonzero(speech[a:min(b, n)])[0]
+        if len(idx) == 0:
+            continue
+        new_a, new_b = a + int(idx[0]), a + int(idx[-1]) + 1
+        if new_a * FRAME_S < ps[0]["end"]:
+            ps[0]["start"] = round(new_a * FRAME_S, 3)
+        if new_b * FRAME_S > ps[-1]["start"]:
+            ps[-1]["end"] = round(new_b * FRAME_S, 3)
+
+
+def phone_status(row, score, word_phones, j, thresholds):
+    """How to present one phone to the learner: correct | variant | almost | error.
+
+    Rule B decides whether the recogniser's difference counts at all. On top of it:
+    - a dropped /r/ before a consonant or at the end of a word is non-rhotic Indian English (variant);
+    - a flagged phone is an "error" only if the expert-trained scorer agrees it is weak. Otherwise
+      it is "almost". Deletions need a lower score, because the CTC recogniser often misses short
+      sounds in clusters (e.g. /l/ in "sells") even for fluent speakers.
+    """
+    phone, heard = row["phone"], row["heard"]
+    nxt = word_phones[j + 1] if j + 1 < len(word_phones) else None
+    if phone == "ɹ" and heard == "-" and (nxt is None or nxt not in pc.VOWELS):
+        return "variant"
+    if not flag_indian(row, thresholds):
+        return "variant" if heard != phone and (phone, heard) in pc.INDIAN_ENGLISH_ACCEPT else "correct"
+    limit = ERROR_SCORE_DELETION if heard == "-" else ERROR_SCORE_SUBSTITUTION
+    return "error" if score < limit else "almost"
+
+
+# Letter names for acronyms such as "AI" or "USA" (the dictionary would read them as words).
+_LETTER_ARPA = {
+    "A": "EY", "B": "B IY", "C": "S IY", "D": "D IY", "E": "IY", "F": "EH F", "G": "JH IY", "H": "EY CH",
+    "I": "AY", "J": "JH EY", "K": "K EY", "L": "EH L", "M": "EH M", "N": "EH N", "O": "OW", "P": "P IY",
+    "Q": "K Y UW", "R": "AA R", "S": "EH S", "T": "T IY", "U": "Y UW", "V": "V IY",
+    "W": "D AH B AH L Y UW", "X": "EH K S", "Y": "W AY", "Z": "Z IY",
+}
+
+
+def word_to_phones(word):
+    """Canonical phones for one word; all-capital words of 2+ letters are spelled out."""
+    if len(word) > 1 and word.isalpha() and word.isupper():
+        return pc.arpabet_to_phones(" ".join(_LETTER_ARPA[c] for c in word).split())
+    return pc.text_to_phones(word)
+
+
+def pronunciation(text):
+    """Canonical phones per word, for showing the expected pronunciation before recording."""
+    return [{"word": w, "phones": word_to_phones(w)} for w in re.findall(r"[A-Za-z']+", text)]
+
+
+_tts_cache = {}
+
+
+async def synthesize(text, voice="female", rate="normal"):
+    """MP3 bytes of `text` read by an Indian-English neural voice (cached in memory)."""
+    import edge_tts
+    key = (text, voice, rate)
+    if key not in _tts_cache:
+        audio = bytearray()
+        async for chunk in edge_tts.Communicate(text, TTS_VOICES[voice], rate=TTS_RATES[rate]).stream():
+            if chunk["type"] == "audio":
+                audio += chunk["data"]
+        if not audio:
+            raise RuntimeError("The voice service returned no audio.")
+        if len(_tts_cache) >= TTS_CACHE_MAX:
+            _tts_cache.pop(next(iter(_tts_cache)))
+        _tts_cache[key] = bytes(audio)
+    return _tts_cache[key]
 
 
 def _num(v):
@@ -434,7 +555,8 @@ def build_gradio(engine):
 # FastAPI backend (backup / for a React frontend later)
 # =============================================================================
 def build_api(engine):
-    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+    from typing import Literal
+    from fastapi import FastAPI, File, Form, HTTPException, Query, Response, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
 
     app = FastAPI(title="PhonoLens API", version="1.0")
@@ -448,6 +570,27 @@ def build_api(engine):
     @app.get("/prompts")
     def prompts():
         return {"prompts": PROMPTS}
+
+    @app.get("/norms")
+    def norms():
+        """Indian-English vowel targets (Lobanov z-scores + SD) for drawing the vowel chart."""
+        return {"vowels": (engine.norms or {}).get("vowels", {})}
+
+    @app.get("/pronounce")
+    def pronounce(text: str = Query(..., min_length=1, max_length=300)):
+        """Expected (canonical) phones for each word of the sentence."""
+        return {"text": text, "words": pronunciation(text)}
+
+    @app.get("/tts")
+    async def tts(text: str = Query(..., min_length=1, max_length=300),
+                  voice: Literal["female", "male"] = "female",
+                  rate: Literal["normal", "slow"] = "normal"):
+        """The sentence read correctly by a fluent Indian-English voice (audio/mpeg)."""
+        try:
+            audio = await synthesize(text.strip(), voice, rate)
+        except Exception as e:
+            raise HTTPException(503, f"The reference voice is unavailable right now ({type(e).__name__}).")
+        return Response(audio, media_type="audio/mpeg", headers={"Cache-Control": "public, max-age=86400"})
 
     @app.post("/analyze")
     async def analyze(audio: UploadFile = File(...), text: str = Form(...)):
