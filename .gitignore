@@ -1,0 +1,18 @@
+# model weights and app assets (too large for git; produced by the notebooks)
+src/phonolens-ft/
+src/phonolens-app/
+*.safetensors
+*.bin
+*.joblib
+
+# data
+data/
+*.wav
+*.webm
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+.env

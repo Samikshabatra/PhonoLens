@@ -1,0 +1,16 @@
+torch
+transformers>=4.40
+scikit-learn
+numpy
+scipy
+pandas
+librosa
+soundfile
+joblib
+matplotlib
+g2p_en
+nltk
+fastapi
+uvicorn
+python-multipart
+gradio
